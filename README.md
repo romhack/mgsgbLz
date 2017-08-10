@@ -26,9 +26,9 @@ Description
 
 ***-c -i <inst> <fst> <ptr>*** Encode one instance with given fst message and ptr. Just to quickly check translation
 
-***mgsgbLz -c -b <input>***            Compress one input plain binary block with LZ. Useful for tiles/nametables binary compression for further ROM insertion.
+***-c -b <input>***            Compress one input plain binary block with LZ. Useful for tiles/nametables binary compression for further ROM insertion.
 
-***mgsgbLz -t <input>***               Test check plain script for various issues. In almost all cases you don't want line length to be more than 24 symbols. In normal game script (everywhere, except Instance #00), there shouldn't be more than two lines with ¶ symbols. You should use ¤ or ⌂ for next newline. All valid symbols are mentioned in Table.hs. -t command will warn you in case you violate any of those rules. Also during compression, tool will warn you if your instance will not fit WRAM or appropriate ROM space.
+***-t <input>***               Test check input plain script for various issues. In almost all cases you don't want line length to be more than 24 symbols. In normal game script (everywhere, except Instance #00), there shouldn't be more than two lines with ¶ symbols. You should use ¤ or ⌂ for next newline. All valid symbols are mentioned in Table.hs. -t command will warn you in case you violate any of those rules. Also during compression, tool will warn you if your instance will not fit WRAM or appropriate ROM space.
 
 Options:
 
@@ -44,13 +44,13 @@ See additional files in [release](https://github.com/romhack/mgsgbLz/releases/la
 
 2. patchScriptInstance.bat check
   
-2. patchScriptInstance.bat tblCompAll   
+3. patchScriptInstance.bat tblCompAll   
   
-3. check translation
+4. check translation
   
-4. patchScriptInstance.bat X, where X is your current instance
+5. patchScriptInstance.bat X, where X is your current instance
   
-5. go to 3
+6. go to 4
 
 
 Build:
