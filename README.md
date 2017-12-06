@@ -18,17 +18,17 @@ Options:
   
 Description
 
-***-m***                       Rebuild MTE dictionary from plain script (SLOW!). Script should be UTF8 (no BOM) encoded. 
+***-r <input>***               Rebuild dictionary from plain script file. 
 
 ***-d -b <input> <offs>***     Decompress one LZ block from input ROM at offset. 
 
 ***-d -s <input>***            Decode full script from input gameboy ROM.
 
-***-c -i <inst> <fst> <ptr>*** Encode one instance with given fst message and ptr. Just to quickly check translation
+***-c -i <inst> <fst> <ptr>*** Encode one inst with given fst message and ptr. Use for script translation.
 
 ***-c -b <input>***            Compress one input plain binary block with LZ. Useful for tiles/nametables binary compression for further ROM insertion.
 
-***-t <input>***               Test check input plain script for various issues. In almost all cases you don't want line length to be more than 24 symbols. In normal game script (everywhere, except Instance #00), there shouldn't be more than two lines with ¶ symbols. You should use ¤ or ⌂ for next newline. All valid symbols are mentioned in Table.hs. -t command will warn you in case you violate any of those rules. Also during compression, tool will warn you if your instance will not fit WRAM or appropriate ROM space.
+***-t <input>***               Test check input plain script for various issues. In almost all cases you don't want line length to be more than 24 symbols. In normal game script (everywhere, except Instance #00), there shouldn't be more than two lines with [nl] symbols. You should use [clr] or [scrl] for next newline. All valid symbols are mentioned in table.tbl. -t command will warn you in case you violate any of those rules. Also during compression, tool will warn you if your instance will not fit WRAM or appropriate ROM space.
 
 Options:
 
@@ -38,17 +38,17 @@ Options:
 
 
 
-See additional files in [release](https://github.com/romhack/mgsgbLz/releases/latest) archive. Usage examples are in patchScriptInstance.bat file. Recommended translation scheme:  
+See additional files in [release](https://github.com/romhack/mgsgbLz/releases/latest) archive. Usage examples are in compress.bat file. Recommended translation scheme:  
 
 1. translate script instance  
 
-2. patchScriptInstance.bat check
+2. mgsgblz -t "instance #XX.txt" (checking and correcting possible errors)
   
-3. patchScriptInstance.bat tblCompAll   
+3. buildMteDictionary.bat (rebuilding table from translated instances)   
+
+4. compress.bat XX (for comperssion and insertion newly translated instance)
   
-4. check translation
-  
-5. patchScriptInstance.bat X, where X is your current instance
+5. check translation
   
 6. go to 4
 

@@ -8,24 +8,28 @@ import qualified Data.ByteString as B
 import           Data.Int
 import           Data.List
 import           Data.List.Split
-import qualified Data.Map.Lazy        as M
 import           Data.Maybe
 import           Data.Word            (Word16, Word8)
 import           Numeric              (showHex)
-import           Table                (decodeTable, paramCodes, newLineCodes)
 import           Text.Printf
-import           Data.Ord
 import           Data.ByteString.Lazy.Search (strictify, breakOn)
 import           System.Environment
-import           Data.Char (ord)
-import qualified     System.IO.UTF8    as U
+import           Text.Parsec            hiding (count)
+import           Text.Parsec.String
+import qualified Data.HashMap.Strict as HM
+import System.IO
+import System.Console.ANSI
+
+
+import RomhackLib (DecodeTable, EncodeTable, readDecodeTable, readEncodeTable,
+                    decodeByTable, encodeByTable, scriptEntriesParser, addComments)
+
 
 data LzEntry = Liter Word8 | Refer {len :: Int, dist :: Int}
 
 instance Show LzEntry where
   show (Liter b) = " Liter 0x"++ showHex b ""
   show (Refer l d)  =  " Refer {len = 0x" ++ showHex l "" ++ " dist = 0x" ++ showHex d "" ++ "}"
-
 
 
 type Script = [Inst]
@@ -36,9 +40,6 @@ instance Show LzBlock where
 
 type Message = [Word8]
 data Chunk = Chunk { instPtr :: Word16, instBank :: Word8, lzBlocksCount :: Word8 } deriving Show
-
-type DecodeTable = M.Map Word8 String
-type EncodeTable = M.Map String Word8
 
 ----------------------------CONSTANTS-------------------------------------------
 calcRomOffset :: (Word16, Word8) -> Int64 --calculate ROM offset by ptr-bank touple
@@ -56,40 +57,57 @@ dictPtrTblPtr = 0x4787
 dictPtrTblOff :: Int64
 dictPtrTblOff = calcRomOffset(dictPtrTblPtr, mteBank)
 
-
 ----------------------------INTERFACE-------------------------------------------
 main :: IO()
-main = getArgs >>= parse
+main = getArgs >>= parseArgs
   where
-    parse ["-v"] = putStrLn "mgsgbLz v0.1\nMTE and LZ compression tool for MGS:GB game."
-    parse ["-m"] = rebuildDictionary
-    parse ["-d", "-b", inpName, offset] = decompressBlock inpName (read offset)
-    parse ["-d", "-s", inpName] = decodeScript inpName
-    parse ["-c", "-i", instNum, firstMsgNum, instP] = compressInst (read instNum) (read firstMsgNum) (read instP)
-    parse ["-c", "-b", inpName] = compressBlock inpName
-    parse ["-t", inpName] = checkScript inpName
-    parse _ = putStrLn "Usage:\n\
-      \  mgsgbLz -m                       Rebuild dictionary from plain script.\n\
+    parseArgs ["-v"] = putStrLn "mgsgbLz v0.2\nMTE and LZ compression tool for MGS:GB game."
+    parseArgs ["-r", inpName] = rebuildDictionary inpName
+    parseArgs ["-d", "-b", inpName, offset] = decompressBlock inpName (read offset)
+    parseArgs ["-d", "-s", inpName] = decompressScript inpName
+    parseArgs ["-c", "-i", inpName, firstMsgNum, instP] = compressInst inpName (read firstMsgNum) (read instP)
+    parseArgs ["-c", "-b", inpName] = compressBlock inpName
+    parseArgs ["-t", inpName] = checkInstance inpName
+    parseArgs _ = putStrLn "Usage:\n\
+      \  mgsgbLz -r <input>               Rebuild dictionary from plain script file.\n\
       \  mgsgbLz -d -b <input> <offs>     Decompress one LZ block from input ROM at offset.\n\
       \  mgsgbLz -d -s <input>            Decode script from input ROM.\n\
       \  mgsgbLz -c -i <inst> <fst> <ptr> Encode one inst with given fst message and ptr.\n\
       \  mgsgbLz -c -b <input>            Compress one input plain binary block with LZ.\n\
-      \  mgsgbLz -t <input>               Test check plain script for various issues.\n\
+      \  mgsgbLz -t <input>               Test check plain script instance for various issues.\n\
       \Options:\n\
       \  -h     Show this screen.\n\
       \  -v     Show version."
 
-
-rebuildDictionary :: IO() --build and save new MTE dictionary
-rebuildDictionary = do
-  input <- readFile "mgsGbScript.txt"
-  names <- readFile "names.txt"
+rebuildDictionary :: String -> IO() --build and save new MTE dictionary
+rebuildDictionary inputName = do
+  input <- readFile inputName
+  tableStr <- readFile "table.tbl"
+  fullNamesStr <- readFile "names.txt"
   let
-    encodeTable = buildEncodeTable decodeTable
-    dictMte = buildDictionary (lines names) input
-    dictMteSerialized = serializeDictionary encodeTable dictMte
-  Bs.writeFile "mteDictionary.bin" $ Bs.pack dictMteSerialized
+    fullNames = lines fullNamesStr
+    names = nub $ filter (not.null) fullNames --names can repeat
+    encodeTable = readEncodeTable tableStr
+    decodeTable = readDecodeTable tableStr
 
+    commentsFreeLines = filter (not . isPrefixOf "//") $ lines input --skip comments
+    tagsFreeLines = concatMap splitOnTags commentsFreeLines--tags cannot be in MTE
+    strippedInput = concatMap (splitOnStrings names) tagsFreeLines --names are forced in dictionary
+    encodedChunks = map (B.pack . encodeByTable encodeTable) $ filter (not.null) strippedInput
+    mteEntries = take (0x100 - length fullNames) $ getMteFromBs encodedChunks
+
+    plainEntries = map (decodeByTable decodeTable . B.unpack)  mteEntries
+    plainDictionary = fullNames ++ plainEntries --0x100 MTE entries
+    updateProgress :: (Int, String) -> IO()
+    updateProgress (num, _) = hPutStr stderr (printf "\rSearching... [%03d/256]" num)
+
+    encodedDictionary = map ((++[0xFF]) . encodeByTable encodeTable) plainDictionary
+    ptrTbl = buildPtrTbl dictPtrTblPtr encodedDictionary
+  mapM_ updateProgress (zip [1..] plainDictionary) --show progress
+  clearLine
+  hPutStrLn stderr "\rDone."
+  writeFile "mteDictionaryPlain.txt" $ unlines plainDictionary --for information
+  Bs.writeFile "mteDictionary.bin" $ Bs.pack $ ptrTbl ++ concat encodedDictionary
 
 decompressBlock :: String -> Int64 -> IO() --decode one block from ROM at offset
 decompressBlock inputName offset = do
@@ -101,11 +119,13 @@ decompressBlock inputName offset = do
       putStrLn $ printf "Packed LZ block size was 0x%X" offs
       Bs.writeFile "decompressedBlock.bin" $ Bs.pack block
 
-decodeScript :: String -> IO() --decoding script
-decodeScript inputName = do
+decompressScript :: String -> IO() --decoding script
+decompressScript inputName = do
       input <- Bs.readFile inputName
+      decodeTblStr <- readFile "table.tbl"
       let
-        script = removeElement 14 $ map readInst chunks --last but one element is burried and blanked
+        decodeTable = readDecodeTable decodeTblStr
+        instances = removeElement 14 $ map readInst chunks --last but one element is burried and blanked
         chunks = runGet (replicateM 16 getChunk) $ Bs.drop instanceTblOffs input
         getChunk = Chunk <$> getWord16le <*> getWord8 <*> getWord8
         readInst :: Chunk -> Inst
@@ -116,9 +136,10 @@ decodeScript inputName = do
             blocksPtrTbl = runGet (replicateM (fromIntegral blocksCnt) getWord16le) $ Bs.drop (calcRomOffset (ptr, bank)) input
 
         dict = getDictionary dictPtrTblOff input
-        mteDecodedScript = map (decodeMte dict) script
-        plainScript = printScript decodeTable mteDecodedScript
-      writeFile "mgsGbScript.txt" plainScript
+        mteDecodedInstances = map (decodeMte dict) instances
+        outFileNames = ["instance "++ printf"#%02d.txt" (n :: Int) | n<-[0..]]
+        plainInstances = map (printInstance True decodeTable) mteDecodedInstances
+      mapM_ (uncurry writeFile) $ zip outFileNames plainInstances
 
 compressBlock :: String -> IO()
 compressBlock inputName = do
@@ -133,49 +154,77 @@ compressBlock inputName = do
   Bs.writeFile "compressedBlock.bin" $ Bs.pack compressedBlock
 
 
-compressInst :: Int -> Word8 -> Word16 -> IO()
-compressInst instNum firstMsgNum instP = do
-  input <- readFile "mgsGbScript.txt"
+compressInst :: String -> Word8 -> Word16 -> IO()
+compressInst inputName firstMsgNum instP =   do
+  input <- readFile inputName
   dictMteFile <- Bs.readFile "mteDictionary.bin"
+  encodeTableStr <- readFile "table.tbl"
   let
-    encodeTable = buildEncodeTable decodeTable
-    dictMte = parseDictionary $ Bs.unpack dictMteFile
-    instances = splitByDelimStr "{INSTANCE #"   input
-    inst = buildInstance encodeTable dictMte firstMsgNum $ instances !! instNum
+    encodeTable = readEncodeTable encodeTableStr
+    dictMte = splitOn [0xFF] $ drop 0x200 $ Bs.unpack dictMteFile
+    inst = buildInstance encodeTable dictMte firstMsgNum input
     instSerialized = serializeInst instP inst --0x5ebd for 8th inst
-  Bs.writeFile ("inst"++ show instNum ++ ".bin") $ Bs.pack instSerialized
+    dropExt  = reverse . tail . dropWhile ('.' /=) . reverse
+  Bs.writeFile (dropExt inputName ++ ".bin") $ Bs.pack instSerialized
 
-checkScript :: String -> IO()
-checkScript inputName = do
-  input <- U.readFile inputName
+
+checkInstance :: String -> IO() --check for possible script errors
+checkInstance inputName  = do
+  input <- readFile inputName
+  tableStr <- readFile "table.tbl"
   let
-    lenThreshold = 24 --maximum line length without warning
-    encodeTable = buildEncodeTable decodeTable
-    inputLines = lines input --tags are not counted
-    textOnlyList = map (filterOutNewLineChars . removeTags)  inputLines
-    filterOutNewLineChars = filter (not . flip elem "§¶¤⌂\n\r")
-    allLookupedLines :: [(Int, [Int])] --line, columns of not-found items
-    allLookupedLines = zip [1..] (map (lookupLine encodeTable) textOnlyList)
-    notFoundLines = filter (not . null . snd)  allLookupedLines
-    excessLines = map (+1) $ findIndices (\a -> length a > lenThreshold) textOnlyList
-    newCharsOnlyList = map (filter (`elem` "§¶¤⌂")) inputLines
-    excessRepeats = findRepeats newCharsOnlyList
-  putStrLn $ "Chars not found (Ln, Col): " ++ show notFoundLines
-  putStrLn $ "Excessive length lines: " ++ show excessLines
-  putStrLn $ "3 newlines in a row numbers: " ++ show excessRepeats
+    encodeTbl = readEncodeTable tableStr
+    inputLines = lines input
+    noDelimsInputLines = map nullDelims inputLines --nullify delimeters
+    nullDelims str = if isDelimStr str then [] else str
+    isDelimStr str = any (`isPrefixOf` str) ["[block #", "[message #", "//"]
 
 
-lookupLine :: M.Map String Word8 -> String -> [Int] --get indexes of line, which are not found in table
-lookupLine tbl input = map (+1) $ findIndices check input -- +1 as char pos zero based
+    excessLines = map (+1) $ findIndices isExcess noDelimsInputLines
+      where
+        isExcess str = length (encodeByTable encodeTbl stripped) > 24
+          where stripped = concat $ splitOnTags str --strip out tags
+
+    whiteSpaceLines =  map (+1) $ findIndices isWhiteSpace noDelimsInputLines
+      where
+        isWhiteSpace str
+          | length reversed < 2 = False --line less than 2 chars
+          | head reversed == 0x2F = True --space after eol tag
+          | reversed !! 1 == 0x2F = True
+          | otherwise = False
+          where reversed = reverse $ encodeByTable encodeTbl str
+
+    nlCounts = scanl countNls 0 inputLines
+    countNls :: Int -> String -> Int --count newlines, considering previous count accum
+    countNls accum str = if isDelimStr str
+                          then  0 --delims terminated count
+                          else  foldl countStrNl accum $ encodeByTable encodeTbl str
+      where
+        countStrNl accum2 code
+          | code == 0xFE = accum2 + 1 --newline increment count
+          | code `elem` [0xF8, 0xFD, 0xFF] = 0 --eos, scroll, clear resets count
+          | otherwise = accum2
+    fourthLineNumbers = map (+1) $ findIndices (>2) nlCounts
+    fifthLineNumbers = map (+1) $ findIndices (>3) nlCounts
+
+  putStrLn $ "Lines longer 24 characters: " ++ show excessLines
+  putStrLn $ "Out of 3-lines dialog screen bounds lines: " ++ show fourthLineNumbers
+  putStrLn $ "Out of 4-lines info screen bounds lines: " ++ show fifthLineNumbers
+  putStrLn $ "Lines with whitespaces near newline tag: " ++ show whiteSpaceLines
+
+
+splitOnTags :: String -> [String] --split out tags between []
+splitOnTags str = filter (not.null) stripped
   where
-    check chr = isNothing $ M.lookup [chr] tbl
+    stripped = head splitted : map (tail . dropWhile (/=']')) (tail splitted)
+    splitted = splitOn "[" str
 
-findRepeats :: [String] -> [Int] --get indexes of lines with three ¶ in a row
-findRepeats  = go 1
+splitOnStrings :: [String] -> String -> [String] --split out list of substrings from string
+splitOnStrings needles haystack = filter (not.null) splitted
   where
-    go _ [] = []
-    go count ("¶":"¶":"¶":ns) = count : go (count + 1) ("¶":"¶":ns)
-    go count (_:ns) = go (count + 1) ns
+    splitted = foldl splitStr [haystack] needles
+    splitStr accum needle = concatMap (splitOn needle) accum
+
 
 ---------------------------HELPERS----------------------------------------------
 
@@ -200,50 +249,12 @@ merge (x:xs) ys = x:merge ys xs
 
 ----------------------------DICTIONARY------------------------------------------
 
-buildDictionary :: [String] -> String -> [String]
-buildDictionary fullNames input = fullNames ++ sortOn (Down . length) foundSubstrings --sort by length descending
-  where
-    foundSubstrings = take (0x100 - length fullNames) $ substrHistogram 3 16 stripped --dict has 0x100 entries, 16 symbols max in dict
-    stripped = removeTags . removeNames $ filter (/='\n') input --delete names and tags from dict analysis
-    names = nub $ filter (/="") fullNames --names can repeat
-
-    removeNames :: String -> String --delete all found names from input script
-    removeNames [] = []
-    removeNames xss@(x:xs) = if  prefix /= [] then removeNames $ drop (length prefix) xss
-                                              else x: removeNames xs
-                             where
-                               prefix = findPrefix names xss
-                               findPrefix [] _ = []--return name, which is found, else []
-                               findPrefix (n:ns) inp =  if n `isPrefixOf` inp then n
-                                                             else findPrefix ns inp
-
-removeTags :: String -> String
-removeTags [] = [] --delete {} tags
-removeTags(i:is) = if i == '{' then removeTags $ tail (dropWhile (/= '}') is)
-                               else i:removeTags is
-
 buildPtrTbl :: Word16 -> [[Word8]] -> [Word8] --build 16bit ptr tbl by table start addr and serialized entries
 buildPtrTbl start entries = Bs.unpack $ runPut (mapM_ putWord16le tbl)
   where
     tbl = init $ scanl addLen (start + tblLen) entries --last entry doesn't generate
     tblLen = fromIntegral $ 2*length entries
     addLen accum xs = accum + fromIntegral(length xs)
-
-serializeDictionary :: M.Map String Word8 -> [String] -> [Word8] --serialize dict by table and entries
-serializeDictionary table entries = ptrTbl ++ dictBody
-  where
-    ptrTbl = buildPtrTbl dictPtrTblPtr terminatedEntries --0x200 is 2x100 dict entries
-    dictBody = concat terminatedEntries
-    terminatedEntries = map (serializeString table . (++ "§")) entries
-
-splitByDelimStr :: String -> String -> [String] --split string by tags {..} bodies
-splitByDelimStr delim input = map (safeTail.dropWhile (/='\n')) substWithDelims
-  where substWithDelims = split (dropBlanks $ keepDelimsL $ onSublist delim) input
-        safeTail xs = if null xs then error "it's in splitbydelimstr" else tail xs
-
-
-parseDictionary :: [Word8] -> [Message] --get list of dictionary entries from serialized dict
-parseDictionary input = splitOn [0xFF] $ drop 0x200 input --2x100 pointer bytes
 
 getDictionary :: Int64 -> Bs.ByteString -> [Message] --read MTE dictionary from ROM
 getDictionary tblOffs input = map (takeWhile (/=0xFF)) chunks --each entry FF terminateds
@@ -253,63 +264,21 @@ getDictionary tblOffs input = map (takeWhile (/=0xFF)) chunks --each entry FF te
     ptrTblW16 = runGet (replicateM 0x100 getWord16le) $ Bs.drop tblOffs input
 
 ------------------------------DECODE--------------------------------------------
-enumNames :: String -> [String] --get infinite list of {%name% #XX} strings
-enumNames name = ["{"++name++ printf" #%02d}\n" (n :: Int) | n<-[0..]]
 
-printScript :: DecodeTable -> Script -> String
-printScript tbl insts = concat $ merge (enumNames "INSTANCE") $ map printInst insts
+printInstance :: Bool -> DecodeTable -> Inst -> String
+printInstance isAddComments tbl blocks = concat $ merge (enumNames "block") $ map printBlock blocks
   where
-    printInst blocks = concat $ merge (enumNames "BLOCK") $ map printBlock blocks
-    printBlock (LzBlock _ msgs) = concat $ merge (enumNames "MSG") $ map (decodeString tbl) msgs
-
-decodeString :: DecodeTable -> Message -> String --decode one message
-decodeString _ [] = []
-decodeString table (byte:bytes)
-  | byte `elem` paramCodes = printf "{%s 0x%02X}" foundEntry (head bytes) ++ decodeString table (tail bytes)
-  | byte `elem` newLineCodes = foundEntry ++ "\n" ++ decodeString table bytes
-  | otherwise  =  foundEntry ++ decodeString table bytes
-  where
-    foundEntry = fromMaybe (printf "\\%02X" byte) (M.lookup byte table)
-
-getBinaryScript:: [Inst] -> [Word8]
-getBinaryScript  = concatMap getInstScript
-  where
-    getInstScript :: Inst -> [Word8]
-    getInstScript  = concatMap (concat.messages)
-
+    --get infinite list of [%name% #XX] strings
+    enumNames name = ["["++name++ printf" #%02d]\n" (n :: Int) | n<-[0..]]
+    printBlock (LzBlock _ msgs) = concat $ merge (enumNames "message")
+                                    $ map appendNewLine plainMsgs
+      where
+        plainMsgs = if isAddComments then addComments decodedMsgs else decodedMsgs
+        --omit closing 0xFF for pretty print and replace it with newline
+        decodedMsgs = map (decodeByTable tbl . init) msgs
+        appendNewLine s = s ++ ['\n']
 
 ------------------------------ENCODE--------------------------------------------
-
-buildEncodeTable :: M.Map k String -> M.Map String k
-buildEncodeTable = M.fromList . map swap . M.toList
-  where swap (k,v) = (v,k)
-
-serializeString :: EncodeTable -> String -> [Word8]
-serializeString tbl = go
-  where
-    go [] = []
-    go ('\n':is) = go is--discard newlines - only for pretty printing script
-    go input@('{':_) = [tag, arg] ++ go (drop (length tagBody) input)
-      where
-        tagBody = takeWhileInclusive (/= '}') input
-        (tagStr, tagArgStr) = break (== ' ') $ init $ tail tagBody --drop tag brackets
-        arg = read tagArgStr :: Word8
-        tag :: Word8
-        tag = fromMaybe (error (printf "Tag not found: %s" tagBody))
-                    (M.lookup tagStr tbl)
-        takeWhileInclusive _ [] = [] --takeWhile, but include last element
-        takeWhileInclusive p (x:xs) = x : if p x
-                                            then takeWhileInclusive p xs
-                                            else []
-    go (i:is) = tag : go strippedTail
-      where
-        tag = fromMaybe (error (printf "Char \"%s\" with code %d not found" [i] (ord i)))
-                                 (M.lookup [i] tbl)
-        strippedTail--newline should go right after symbol, discard spaces etc. which will go in serialized otherwise
-          | tag `elem` newLineCodes = dropWhile (/= '\n') is
-          | otherwise = is
-
-
 
 findNotUsedByte :: [Word8] -> Word8 --find byte in input, which is not used for LZ encoding flag
 findNotUsedByte xs = go [0..0xFF]
@@ -319,18 +288,38 @@ findNotUsedByte xs = go [0..0xFF]
 
 --build instance from char encoding table, serialized MTE dictionary and
 --plain instance in string
-buildInstance :: M.Map String Word8 -> [Message] -> Word8 -> String -> Inst
-buildInstance encodeTable mteDict firstMsgNum plainBlock = blocks
-  where
-    plainBlocks =  splitByDelimStr "{BLOCK #" plainBlock
-    blocksMessages = map (splitByDelimStr "{MSG #") plainBlocks --divide on blocks and messages:: [[String]]
-    msgCounts = tail $ scanl addLen firstMsgNum blocksMessages--start with first length
+buildInstance :: EncodeTable -> [Message] -> Word8 -> String -> Inst
+buildInstance encodeTable mteDict firstMsgNum inst =
+                                    zipWith buildBlock msgCounts serializedMsgs
+  where --append with FF as end of message was omitted in printed script
+    serializedMsgs = map (map (\s -> s ++ [0xFF])) parsedMsgs
+    parsedMsgs = parseMsgsByTable encodeTable inst
+    msgCounts = tail $ scanl addLen firstMsgNum serializedMsgs--start with first length
     addLen accum strs = accum + fromIntegral (length strs)
-    blocks = zipWith buildBlock msgCounts blocksMessages
-    buildBlock lastMsgIdx msgs = LzBlock lastMsgIdx mteEncodedMsgs --assemble into LzBlock structure
-      where
-        serializedMsgs = map (serializeString encodeTable) msgs
-        mteEncodedMsgs = map (encodeMte mteDict) serializedMsgs
+    buildBlock lastMsgIdx msgs = LzBlock lastMsgIdx mteEncodedMsgs --assemble LzBlock
+      where mteEncodedMsgs = map (encodeMte mteDict) msgs
+
+-- split on [blocks[messages]] and encode by table
+parseMsgsByTable :: EncodeTable -> String -> [[Message]]
+parseMsgsByTable encodeTbl plainInst = case parse (instanceParser encodeTbl)
+                                  "Script parse failed" plainInst of
+                                    Left err -> error $ show err
+                                    Right blocks -> blocks
+
+--parse multiple entries into inclosed lists of bytes [block[messages]]
+instanceParser :: EncodeTable ->  Parser [[Message]]
+instanceParser encodeTable = blockDelim >> block `manyTill` eof
+  where
+    block =  messageDelim >> message `manyTill` (eof <|> try blockDelim)
+    message = scriptEntriesParser encodeTable messageEndings
+    messageEndings = eof <|> Text.Parsec.lookAhead (try blockDelim) <|> try messageDelim
+    messageDelim = lexeme $ voidLine"[message #"
+    blockDelim = lexeme $ voidLine "[block #"
+    lexeme p = many (newLines <|> comments) >> p
+    comments = void $ try $ string "//" >> anyChar `manyTill` newline
+    newLines = void $ try newline
+    voidLine :: String -> Parser ()
+    voidLine s = void $ string s >> anyChar `manyTill` newline
 
 serializeInst :: Word16 -> Inst -> [Word8] --serialize instance with ptr in ROM and instance given
 serializeInst instPtrTblPtr blocks = ptrTbl ++ concat serializedBlocks
@@ -362,23 +351,6 @@ decodeMte dict  = map decodeBlock
       | x == 0xFB = dict !! fromIntegral idx ++ decodeMsg xs
       | otherwise  = x : decodeMsg (idx:xs)
 
-substrHistogram :: Int -> Int -> String -> [String] --get repeated substrings list sorted by freq*length
-substrHistogram minLen maxLen is = takeWhile (/=[]) $ go [is] --loop while repeating substrings are found
- where
-   go xs = bestMte : go strippedInput
-     where
-       strippedInput = concatMap (splitOn bestMte) xs --strip found mte entry from input string
-       --find most frequent substring in input stings list
-       bestMte  = if M.null freqMap then [] --no more repeated substrings found
-                  else  fst $ maximumBy lenFreqCompare $ M.toList freqMapNoSpecial
-         where
-           lenFreqCompare (w1, f1) (w2, f2) = (f1*length w1) `compare` (f2 * length w2) --compare words by length and frequency
-           freqMapNoSpecial = M.filterWithKey noSpecialChars freqMap
-           noSpecialChars s _ = all (`notElem` s) ['§','¶','¤','⌂']
-           freqMap = M.filter (> 1) $ M.fromListWith (+) [(c, 1) | c <- getAllWords] --don't take words, which don't repeat
-           getAllWords = concatMap wordsStartingHere $ concatMap (init. tails) xs --get all possible words starting here. last is empty, discard
-           wordsStartingHere ys = drop minLen $ take (maxLen+1) $ inits ys
-
 encodeMte :: [Message] -> Message -> Message --encode serialized script with MTE table given
 encodeMte _ [] = []
 encodeMte dictMte input@(i:is) = if  isJust dictIndexLen --if found, then emit MTE byte touple
@@ -392,6 +364,34 @@ encodeMte dictMte input@(i:is) = if  isJust dictIndexLen --if found, then emit M
                                findPrefix ([]:ns) inp count = findPrefix ns inp  (count + 1) --empty entry in mte table, pass
                                findPrefix (n:ns) inp count =  if n `isPrefixOf` inp then Just (count, length n)
                                                                 else findPrefix ns inp (count + 1)
+
+getMteFromBs :: [B.ByteString] -> [B.ByteString]
+getMteFromBs [] = []
+getMteFromBs strs = if null subs then [] -- no more substrings possible, exhausted string
+                        else bestMte : getMteFromBs strippedInput --strip and find next MTE
+  where
+    mteCodeSize = 1 -- 1 byte per MTE code additionally
+    minLen = 3
+    maxLen = 16
+    subs = concatMap substrings strs
+    substrings s = [ i | t <- B.tails s,
+                          i <- drop minLen (take maxLen (B.inits t))]
+    (bestMte, _, _) = HM.foldlWithKey' getMax (B.empty, 0, 0) freqMap
+    freqMap :: HM.HashMap B.ByteString Int
+    freqMap = HM.fromListWith (+) [(s, 1) | s <- subs]
+
+    getMax (accStr, accCount, accWeight) str count
+      | curWeight > accWeight = (str, count, curWeight)
+      | curWeight == accWeight && count > accCount = (str, count, curWeight)
+      | otherwise = (accStr, accCount, accWeight)
+      where curWeight = count * (B.length str - mteCodeSize)
+        --weight = replace len x number of occurences - MTE bytes taken
+    strippedInput = concatMap strip strs
+    strip haystack = clean : if B.null rest then []
+                              else strip $ B.drop mteLen rest
+      where
+        (clean, rest) = B.breakSubstring bestMte haystack
+        mteLen = B.length bestMte
 
 ---------------------------LZ---------------------------------------------------
 getDecodedLzBlockMessages :: Get [Message]
