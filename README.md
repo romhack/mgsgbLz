@@ -5,7 +5,8 @@ GB Metal Gear Solid: Ghost Babel script tool. Game uses MTE and LZ compression f
 
 Synopsis:
 ```
-mgsgbLz -m                       
+mgsgbLz -r <input>                      
+mgsgbLz -ra <inputs> <weights>
 mgsgbLz -d -b <input> <offs>     
 mgsgbLz -d -s <input>            
 mgsgbLz -c -i <inst> <fst> <ptr> 
@@ -18,9 +19,11 @@ Options:
   
 Description
 
-***-r <input>***               Rebuild dictionary from plain script file. 
+***-r <input> ***               Rebuild dictionary from plain script file.
 
-***-d -b <input> <offs>***     Decompress one LZ block from input ROM at offset. 
+***-ra <inputs> <weights>***   Rebuild adaptive from multipe files, specifying weight of this file (what part of dictionary will be devoted to this script file). For instance, mgsgblz -ra "instance #00.txt" 1 "instance #03.txt" 1 "instance #08.txt" 3 "instance #09.txt" 2 will build dictionary mostly from "instance #08.txt", compressing it with MTE at a higher rates.
+
+***-d -b <input> <offs>***     Decompress one LZ block from input ROM at offset.\n\
 
 ***-d -s <input>***            Decode full script from input gameboy ROM.
 

@@ -3,26 +3,29 @@ import           Control.Monad
 import           Data.Binary.Get
 import           Data.Binary.Put
 import           Data.Bits
-import qualified Data.ByteString.Lazy as Bs
-import qualified Data.ByteString as B
+import qualified Data.ByteString             as B
+import qualified Data.ByteString.Lazy        as Bs
+import           Data.ByteString.Lazy.Search (breakOn, strictify)
+import qualified Data.HashMap.Strict         as HM
 import           Data.Int
 import           Data.List
 import           Data.List.Split
 import           Data.Maybe
-import           Data.Word            (Word16, Word8)
-import           Numeric              (showHex)
-import           Text.Printf
-import           Data.ByteString.Lazy.Search (strictify, breakOn)
+import           Data.Word                   (Word16, Word8)
+import           Numeric                     (showHex)
+import           System.Console.ANSI
 import           System.Environment
-import           Text.Parsec            hiding (count)
+import           System.IO
+import           Text.Parsec                 hiding (count)
 import           Text.Parsec.String
-import qualified Data.HashMap.Strict as HM
-import System.IO
-import System.Console.ANSI
+import           Text.Printf
 
 
-import RomhackLib (DecodeTable, EncodeTable, readDecodeTable, readEncodeTable,
-                    decodeByTable, encodeByTable, scriptEntriesParser, addComments)
+import           RomhackLib                  (DecodeTable, EncodeTable,
+                                              addComments, decodeByTable,
+                                              encodeByTable, readDecodeTable,
+                                              readEncodeTable,
+                                              scriptEntriesParser)
 
 
 data LzEntry = Liter Word8 | Refer {len :: Int, dist :: Int}
@@ -61,7 +64,8 @@ dictPtrTblOff = calcRomOffset(dictPtrTblPtr, mteBank)
 main :: IO()
 main = getArgs >>= parseArgs
   where
-    parseArgs ["-v"] = putStrLn "mgsgbLz v0.2\nMTE and LZ compression tool for MGS:GB game."
+    parseArgs ["-v"] = putStrLn "mgsgbLz v0.3\nMTE and LZ compression tool for MGS:GB game."
+    parseArgs ("-ra": inpNames) = rebuildDictionaryAdaptive inpNames
     parseArgs ["-r", inpName] = rebuildDictionary inpName
     parseArgs ["-d", "-b", inpName, offset] = decompressBlock inpName (read offset)
     parseArgs ["-d", "-s", inpName] = decompressScript inpName
@@ -70,6 +74,7 @@ main = getArgs >>= parseArgs
     parseArgs ["-t", inpName] = checkInstance inpName
     parseArgs _ = putStrLn "Usage:\n\
       \  mgsgbLz -r <input>               Rebuild dictionary from plain script file.\n\
+	  \  mgsgbLz -ra <inputs> <weights>   Rebuild adaptive from multipe files.\n\
       \  mgsgbLz -d -b <input> <offs>     Decompress one LZ block from input ROM at offset.\n\
       \  mgsgbLz -d -s <input>            Decode script from input ROM.\n\
       \  mgsgbLz -c -i <inst> <fst> <ptr> Encode one inst with given fst message and ptr.\n\
@@ -79,7 +84,7 @@ main = getArgs >>= parseArgs
       \  -h     Show this screen.\n\
       \  -v     Show version."
 
-rebuildDictionary :: String -> IO() --build and save new MTE dictionary
+rebuildDictionary :: String -> IO() --build and save new MTE dictionary from single script file
 rebuildDictionary inputName = do
   input <- readFile inputName
   tableStr <- readFile "table.tbl"
@@ -108,6 +113,81 @@ rebuildDictionary inputName = do
   hPutStrLn stderr "\rDone."
   writeFile "mteDictionaryPlain.txt" $ unlines plainDictionary --for information
   Bs.writeFile "mteDictionary.bin" $ Bs.pack $ ptrTbl ++ concat encodedDictionary
+
+rebuildDictionaryAdaptive :: [String] -> IO() --build and save new MTE dictionary from multiple script files
+rebuildDictionaryAdaptive params = do
+  let
+    filesList :: [(String, Int)]
+    filesList = makeTuples params
+
+    makeTuples (name: portion:xs) = (name, read portion): makeTuples xs
+    makeTuples _                  = []
+
+  inputs <- mapM (readFile . fst) filesList
+  tableStr <- readFile "table.tbl"
+  fullNamesStr <- readFile "names.txt"
+  let
+    fullNames = lines fullNamesStr
+    names = nub $ filter (not.null) fullNames --names can repeat
+    encodeTable = readEncodeTable tableStr
+    decodeTable = readDecodeTable tableStr
+
+    getMteEntries :: String -> [String]
+    getMteEntries input = map (decodeByTable decodeTable . B.unpack)  mteEntries
+      where
+        commentsFreeLines = filter (not . isPrefixOf "//") $ lines input --skip comments
+        tagsFreeLines = concatMap splitOnTags commentsFreeLines--tags cannot be in MTE
+        strippedInput = concatMap (splitOnStrings names) tagsFreeLines --names are forced in dictionary
+        encodedChunks = map (B.pack . encodeByTable encodeTable) $ filter (not.null) strippedInput
+        mteEntries = take (0x100 - length fullNames) $ getMteFromBs encodedChunks
+
+    mteList = map getMteEntries inputs
+    mtePairs = mteList `zip` map snd filesList
+    plainEntries = mergeByRatios mtePairs $ 0x100 - length fullNames
+    plainDictionary = fullNames ++ plainEntries --0x100 MTE entries
+
+    updateProgress :: (Int, String) -> IO()
+    updateProgress (num, _) = hPutStr stderr (printf "\rSearching... [%03d/256]" num)
+
+    encodedDictionary = map ((++[0xFF]) . encodeByTable encodeTable) plainDictionary
+    ptrTbl = buildPtrTbl dictPtrTblPtr encodedDictionary
+  mapM_ updateProgress (zip [1..] plainDictionary) --show progress
+  clearLine
+  hPutStrLn stderr "\rDone."
+  writeFile "mteDictionaryPlain.txt" $ unlines plainDictionary --for information
+  Bs.writeFile "mteDictionary.bin" $ Bs.pack $ ptrTbl ++ concat encodedDictionary
+
+
+--take from each of given lists based on it's given proportion in tuple
+--(list, weight), the bigger the weight, the longer prefix will be taken
+--from exactly this list and other lists portion will be reduced
+mergeByRatios :: (Eq a) => [([a], Int)] -> Int -> [a]
+mergeByRatios pairs total = foldl takeUnique [] lenPairs
+  where
+    lists = map fst pairs
+    proportions = map snd pairs
+    totalProportions = sum proportions
+    unitLen = total `div` totalProportions
+    initLengths = map (*unitLen) $ init proportions
+    lengths = initLengths ++ [total - sum initLengths]--last takes leftover space
+    lenPairs = lengths `zip` lists
+
+takeUnique :: (Eq a) => [a] -> (Int, [a]) -> [a] --take n elems, only if not found in haystack
+takeUnique haystack pairs = haystack ++ go pairs
+  where
+    go (0, _) = [] --end of count
+    go (_, []) = [] --needle exhausted
+    go (n, x : xs) = if x `elem` haystack
+      then go (n, xs)
+      else x : go (n - 1, xs)
+
+
+
+divideInterval :: Int -> Int -> [Int] --list of lengths for dividing given range by n chunks
+divideInterval range n = replicate (n - 1) meanLen ++ [lastChunk]
+  where
+    meanLen = range `div` n
+    lastChunk = range - (meanLen * (n - 1))
 
 decompressBlock :: String -> Int64 -> IO() --decode one block from ROM at offset
 decompressBlock inputName offset = do
@@ -179,12 +259,32 @@ checkInstance inputName  = do
     nullDelims str = if isDelimStr str then [] else str
     isDelimStr str = any (`isPrefixOf` str) ["[block #", "[message #", "//"]
 
+    stringPixelLen str = calcPixLen (encodeByTable encodeTbl stripped)
+              where
+                stripped = concat $ splitOnTags str  --strip out tags
+                calcPixLen charCodes = sum $ map ((lengthList !!) . fromIntegral) charCodes
+                  where
+                    lengthList :: [Int] --pixel width of each char code
+                    lengthList = [6,3,6,6,7,6,6,6,6,6,
+                                  6,6,6,6,5,5,7,6,4,7,
+                                  6,5,7,6,6,6,6,6,6,6,
+                                  6,6,8,6,6,6,9,3,8,6,
+                                  6,3,5,3,8,5,5,2,6,5,
+                                  5,6,5,6,5,5,2,5,5,2,
+                                  8,5,5,5,5,5,5,4,6,6,
+                                  8,6,5,5,8,8,8,8,8,8,
+                                  8,0,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+                                  6,6,6,5,7,5,6,6,6,6,6,6,6,6,6,6,
+                                  6,6,6,6,6,8,6,7,6,6,7,7,7,6,6,7,
+                                  6,6,5,5,5,5,5,5,8,6,6,6,5,6,6,5,
+                                  5,5,5,5,6,5,6,6,6,5,6,7,6,6,5,5,
+                                  7,5,7,7,8,8,8,8,8,8,8,8,8,8,8,8,
+                                  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+                                  8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+                                  5,6,4,3,3,8,8,5,3,5,5,6,8,8,8,3]
 
-    excessLines = map (+1) $ findIndices isExcess noDelimsInputLines
-      where
-        isExcess str = length (encodeByTable encodeTbl stripped) > 24
-          where stripped = concat $ splitOnTags str --strip out tags
-
+    excessPixLines = map (+1) $ findIndices (\s -> stringPixelLen s > 16*8) noDelimsInputLines
+  --  shortPixLines = map (+1) $ findIndices (\s -> stringPixelLen s < 8*8) noDelimsInputLines
     whiteSpaceLines =  map (+1) $ findIndices isWhiteSpace noDelimsInputLines
       where
         isWhiteSpace str
@@ -204,12 +304,13 @@ checkInstance inputName  = do
           | code == 0xFE = accum2 + 1 --newline increment count
           | code `elem` [0xF8, 0xFD, 0xFF] = 0 --eos, scroll, clear resets count
           | otherwise = accum2
-    fourthLineNumbers = map (+1) $ findIndices (>2) nlCounts
-    fifthLineNumbers = map (+1) $ findIndices (>3) nlCounts
+    fourthLineNumbers = findIndices (>2) nlCounts
+    fifthLineNumbers =  findIndices (>3) nlCounts
 
-  putStrLn $ "Lines longer 24 characters: " ++ show excessLines
+  putStrLn $ "Lines longer 16 tiles: " ++ show excessPixLines
   putStrLn $ "Out of 3-lines dialog screen bounds lines: " ++ show fourthLineNumbers
   putStrLn $ "Out of 4-lines info screen bounds lines: " ++ show fifthLineNumbers
+  -- putStrLn $ "Lines shorter 8 tiles: " ++ show shortPixLines
   putStrLn $ "Lines with whitespaces near newline tag: " ++ show whiteSpaceLines
 
 
@@ -243,8 +344,8 @@ removeElement idx xs = start ++ tail end
   where (start, end) = splitAt idx xs
 
 merge :: [a] -> [a] -> [a] --merge two lists intercalated
-merge [] _ = [] --if first list is finished, return merged list
-merge _ [] = [] --if second list finished, return merged list
+merge [] _      = [] --if first list is finished, return merged list
+merge _ []      = [] --if second list finished, return merged list
 merge (x:xs) ys = x:merge ys xs
 
 ----------------------------DICTIONARY------------------------------------------
@@ -283,7 +384,7 @@ printInstance isAddComments tbl blocks = concat $ merge (enumNames "block") $ ma
 findNotUsedByte :: [Word8] -> Word8 --find byte in input, which is not used for LZ encoding flag
 findNotUsedByte xs = go [0..0xFF]
   where
-    go [] = error "Lz start byte not found"
+    go []     = error "Lz start byte not found"
     go (n:ns) = if n `notElem` xs then n else go ns
 
 --build instance from char encoding table, serialized MTE dictionary and
@@ -303,7 +404,7 @@ buildInstance encodeTable mteDict firstMsgNum inst =
 parseMsgsByTable :: EncodeTable -> String -> [[Message]]
 parseMsgsByTable encodeTbl plainInst = case parse (instanceParser encodeTbl)
                                   "Script parse failed" plainInst of
-                                    Left err -> error $ show err
+                                    Left err     -> error $ show err
                                     Right blocks -> blocks
 
 --parse multiple entries into inclosed lists of bytes [block[messages]]
@@ -403,10 +504,10 @@ getDecodedLzBlockMessages = do
     readMsg :: Int -> Message
     readMsg offs = go (drop offs decodedBlock)
       where
-        go [] = []
+        go []             = []
         go (0xFB:code:xs) = 0xFB:code:go xs --we're in MTE, don't detect FF
-        go (0xFF:_) = [0xFF] --end of msg found
-        go (x:xs) = x : go xs --usual char, takt to msg
+        go (0xFF:_)       = [0xFF] --end of msg found
+        go (x:xs)         = x : go xs --usual char, takt to msg
   return $ map readMsg msgPtrTbl
 
 getDecodedLzBlock :: Get [Word8]
@@ -477,10 +578,6 @@ findInBufferMatch :: Bs.ByteString -> Bs.ByteString -> (Int, Int)
 findInBufferMatch needle' haystack' = go n haystack'
   where
     n = strictify $ Bs.take (fromIntegral matchLenMax) needle'
-    -- memory is not inited in some cases, do not rely on tailzeros and ringbuffer - delete after testing
-    --h = Bs.concat [haystack', tailZeros, startOfHay] --form a ring of buffer after window
-    --tailZeros = Bs.replicate (fromIntegral windowSize - Bs.length haystack' + 1) 0 --uninited memory within window
-    --startOfHay = Bs.take (fromIntegral matchLenMax) haystack' --continue from beginning as ring buffer
     go :: B.ByteString -> Bs.ByteString -> (Int, Int)
     go needle haystack
       | B.null needle = (0, 0) --match is not found at all
